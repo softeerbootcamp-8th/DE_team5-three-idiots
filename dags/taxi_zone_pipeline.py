@@ -14,12 +14,20 @@ build_taxi_zone_silver1은 Asset("taxi_zone_silver1_updated")를 outlet으로
 같은 날 겹치면 중복 실행되던 문제가 있었음). build_taxi_zone_silver1이
 변경 없음으로 스킵되면 이 Asset도 emit되지 않아 zone_segment_pipeline이
 매달 헛돌지 않는다.
+
+TaskFlow(@task)를 쓴다 - 예전에는 PythonOperator + op_kwargs에 Jinja
+문자열("{{ ti.xcom_pull(...) }}")로 XCom을 넘겼는데, 이러면 Airflow가
+기본적으로 렌더링 결과를 문자열로 반환한다(DAG에 render_template_as_native_obj=True를
+안 준 이상) - ingest_taxi_zone_shapefile이 반환한 dict가
+"{'changed': True, ...}" 같은 그냥 문자열이 되어 build()의
+shapefile_result.get("changed", True) 호출이 AttributeError로 죽었다
+(실제로 겪음). TaskFlow는 XCom을 파이썬 객체 그대로 넘겨줘서 이 문제
+자체가 없다.
 """
 
 from datetime import datetime
 
-from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.decorators import dag, task
 from airflow.sdk import Asset
 
 from src.common.alerts import notify_slack_failure
@@ -28,12 +36,12 @@ from src.taxi_zone.silver1 import build as build_taxi_zone_silver1
 
 default_args = {
     "retries": 2,
-    "on_failure_callback": notify_slack_failure,
 }
 
 TAXI_ZONE_SILVER1_UPDATED = Asset("taxi_zone_silver1_updated")
 
-with DAG(
+
+@dag(
     dag_id="taxi_zone_pipeline",
     description="TLC Taxi Zone 정적 참조 데이터 S3 Bronze/Silver1 적재 (월 1회 변경 확인)",
     schedule="0 4 1 * *",          # 매월 1일 새벽 4시
@@ -41,19 +49,20 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     default_args=default_args,
+    on_failure_callback=notify_slack_failure,
     tags=["taxi_zone", "monthly"],
-) as dag:
-    shapefile = PythonOperator(
-        task_id="ingest_taxi_zone_shapefile",
-        python_callable=ingest_taxi_zone_shapefile,
-    )
-    silver1 = PythonOperator(
-        task_id="build_taxi_zone_silver1",
-        python_callable=build_taxi_zone_silver1,
-        op_kwargs={
-            "shapefile_result": "{{ ti.xcom_pull(task_ids='ingest_taxi_zone_shapefile') }}",
-        },
-        outlets=[TAXI_ZONE_SILVER1_UPDATED],
-    )
+)
+def taxi_zone_pipeline():
 
-    shapefile >> silver1
+    @task(task_id="ingest_taxi_zone_shapefile")
+    def ingest_shapefile() -> dict:
+        return ingest_taxi_zone_shapefile()
+
+    @task(task_id="build_taxi_zone_silver1", outlets=[TAXI_ZONE_SILVER1_UPDATED])
+    def build_silver1(shapefile_result: dict) -> str:
+        return build_taxi_zone_silver1(shapefile_result)
+
+    build_silver1(ingest_shapefile())
+
+
+taxi_zone_pipeline()

@@ -42,15 +42,35 @@ TIME_SLOTS = tuple(
 )
 DATE_PARTITION_PATTERN = re.compile(r"^date=(\d{4}-\d{2}-\d{2})$")
 
+# expand_zone_values_to_segments의 zone→segment fan-out join 결과를 몇
+# 파티션으로 나눌지. broadcast join은 결과 파티션 수를 왼쪽(segments)
+# 파티션 수 그대로 물려받는데, mapping parquet 파일 자체의 파티션 수(보통
+# 1~2개)에 맡겨두면 세그먼트 수가 많을 때(7,300만 건까지) 태스크 한두
+# 개에 다 몰려서 OOM으로 executor가 죽는 사고가 있었다.
+SEGMENT_EXPANSION_PARTITIONS = 200
+
 # RDS 쓰기 병렬도. executor마다 자기 파티션을 독립 커넥션으로 쓰게 해서,
 # driver가 toLocalIterator()로 한 줄씩 순차 처리할 때보다 wall-clock을
 # 파티션 수만큼 나눈다(Airflow heartbeat timeout 예방 — segment 수가 많으면
 # 순차 처리가 5분을 넘겨 태스크가 강제 종료되는 사고가 있었다).
+#
 # DynamoDB 시절엔 순간 처리량 한도(RequestLimitExceeded) 때문에 32에서
-# 10으로 낮췄었다. RDS는 그 대신 "동시 커넥션 수"가 한도라(소형 인스턴스
-# 기준 max_connections가 보통 100 안팎) 이름은 legacy를 유지하되 값은 그대로
-# 보수적으로 둔다 — 아래 스레드 수와 곱해 동시 커넥션이 20개를 넘지 않게.
-TYPE3_RDS_WRITE_PARTITIONS = 10
+# 10으로 낮췄었다 - 그때는 세그먼트당 항목 1개(JSONB 중첩)라 총 21.8만
+# 행이었다. 2026-08-24 스키마 개편으로 세그먼트당 336행(요일×시간 슬롯)으로
+# flat하게 펼치면서 총 행 수가 위 SEGMENT_EXPANSION_PARTITIONS와 똑같은
+# 규모(7,300만 건)까지 늘었는데, 이 값을 안 맞춰서 EMR 잡이
+# ExecutorDeadException/FetchFailedException으로 실패하는 사고가 실제로
+# 있었다.
+#
+# SEGMENT_EXPANSION_PARTITIONS(위)가 이미 겪었던 것과 똑같은 사고다 —
+# expand_zone_values_to_segments가 7,300만 건을 200개 파티션으로 잘 나눠서
+# 넘겨주는데, 여기서 그걸 10개로 다시 뭉쳐버리면서(repartition) 그 이전
+# 수정이 무효화됐다. 같은 값으로 맞춘다 - RDS는 "동시 커넥션 수"가
+# 한도라(소형 인스턴스 기준 max_connections 보통 100 안팎) 파티션 수
+# 자체보다 "동시에 실행되는 파티션 수 × 아래 스레드 수"가 실제 동시
+# 커넥션 수를 결정한다(동시 실행 파티션 수는 executor 코어 수만큼으로
+# 제한됨) - 파티션 수만 늘리는 건 이 한도에 영향을 안 준다.
+TYPE3_RDS_WRITE_PARTITIONS = SEGMENT_EXPANSION_PARTITIONS
 
 # 파티션 하나(executor 하나) 안에서 쓰기를 몇 개의 스레드로 나눠 돌릴지.
 # RDS 쓰기도 CPU가 아니라 네트워크 왕복 대기가 지배적인 I/O bound 작업이라,
@@ -59,17 +79,12 @@ TYPE3_RDS_WRITE_PARTITIONS = 10
 # 완화하기 위함). 스레드마다 db.new_connection()으로 자기만의 커넥션을 열어
 # 쓴다(psycopg2 커넥션은 스레드 간 공유가 안전하지 않음).
 # 동시 커넥션 수는 대략 TYPE3_RDS_WRITE_PARTITIONS × 이 값이므로(기본
-# 10 × 2 = 20), RDS의 max_connections를 넘지 않게 여유를 두고 안전이 확인되면
-# 조심스럽게 올릴 것. PgBouncer/RDS Proxy 앞단이 있다면 그쪽 풀 크기도 같이
-# 고려해야 한다.
+# 200 × 2 = 400이지만, 동시 실행 파티션 수는 executor 코어 수로 제한되니
+# 실제 동시 커넥션은 그보다 훨씬 작다), RDS의 max_connections를 넘지
+# 않게 여유를 두고 안전이 확인되면 조심스럽게 올릴 것. PgBouncer/RDS
+# Proxy 앞단이 있다면 그쪽 풀 크기도 같이 고려해야 한다.
 TYPE3_RDS_WRITE_THREADS_PER_PARTITION = 2
 
-# expand_zone_values_to_segments의 zone→segment fan-out join 결과를 몇
-# 파티션으로 나눌지. broadcast join은 결과 파티션 수를 왼쪽(segments)
-# 파티션 수 그대로 물려받는데, mapping parquet 파일 자체의 파티션 수(보통
-# 1~2개)에 맡겨두면 세그먼트 수가 많을 때(7,300만 건까지) 태스크 한두
-# 개에 다 몰려서 OOM으로 executor가 죽는 사고가 있었다.
-SEGMENT_EXPANSION_PARTITIONS = 200
 TAXI_ZONE_IDS = tuple(range(1, 264))
 DOW_NAMES = TLC_TYPE3_DOW_NAMES
 SPARK_DOW_NAMES = (DOW_NAMES[-1], *DOW_NAMES[:-1])
