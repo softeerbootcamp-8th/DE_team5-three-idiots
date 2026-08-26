@@ -1,6 +1,28 @@
 """공통 유틸."""
 
+import requests
 import re
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+def make_session():
+    """네트워크 오류 시 자동 재시도하는 세션."""
+    session = requests.Session()
+
+    retry = Retry(
+        total=5,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+
+    session.mount(
+        "https://",
+        HTTPAdapter(max_retries=retry),
+    )
+
+    return session
 
 
 def save_parquet(df, out_dir, filename="data.parquet"):
@@ -16,16 +38,6 @@ def save_parquet(df, out_dir, filename="data.parquet"):
     df.to_parquet(str(final), index=False)
 
     return final
-
-def unique_in_order(values: list[str]) -> list[str]:
-    """중복을 제거하되 처음 등장한 순서는 유지한다.
-
-    서빙 조회부(nav_lookup.py/toll/serving.py/api.py)가 같은 segment_id로
-    RDS를 여러 번 부르지 않으려고 각자 `list(dict.fromkeys(...))`를
-    반복 구현하던 걸 공용화한 것 - dict는 3.7+부터 삽입 순서를 보장하므로
-    이 트릭이 성립한다."""
-    return list(dict.fromkeys(values))
-
 
 def clean_street(value):
     """

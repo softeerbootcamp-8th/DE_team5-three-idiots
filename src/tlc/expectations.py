@@ -1,21 +1,52 @@
 """TLC Bronze taxi_type별 Great Expectations 정의.
 
 COLUMN_MAPPING(원본 컬럼명 → Silver 컬럼명 개념의 매핑)으로 taxi_type별
-필수 컬럼 구성을 정의한다. Silver1 변환 로직(silver1_transform.py)이 쓰는
-것과 정확히 같은 매핑이어야 한다 — Bronze 검증이 "필수"라고 판단하는
-원본 컬럼과 Silver1이 실제로 rename하는 원본 컬럼이 어긋나면, 검증은
-통과했는데 Silver1이 컬럼을 못 찾아 죽거나 반대로 Silver1은 정상인데
-검증이 있지도 않은 컬럼을 요구하는 사고가 난다. 예전엔 이 상수를 각자
-파일에 복붙해 갖고 있어서(코드 리뷰에서 지적된 드리프트 위험) 한쪽만
-고치면 조용히 어긋날 수 있었다 - silver1_transform.py를 원본으로 두고
-여기서 그대로 가져와 쓴다. pyspark는 이미 이 검증이 실행되는 EMR
-Spark 잡 안에서만 쓰이므로(spark_jobs/tlc_pipeline_job.py) 새로운
-의존성이 아니다.
+필수 컬럼 구성을 정의한다. 원래는 Silver1 변환 로직(silver1_transform.py)과
+공유하던 상수였으나, Silver1이 이 파이프라인 범위에서 빠지면서 Bronze
+검증 전용으로 이 파일에 남겼다.
 """
 
 import great_expectations as gx
 
-from src.tlc.silver1_transform import COLUMN_MAPPING
+COLUMN_MAPPING = {
+
+    # Yellow Taxi
+    "yellow": {
+        "tpep_pickup_datetime": "pickup_datetime",
+        "tpep_dropoff_datetime": "dropoff_datetime",
+        "PULocationID": "pickup_location_id",
+        "DOLocationID": "dropoff_location_id",
+        "passenger_count": "passenger_count",
+        "trip_distance": "trip_distance",
+    },
+
+    # Green Taxi
+    "green": {
+        "lpep_pickup_datetime": "pickup_datetime",
+        "lpep_dropoff_datetime": "dropoff_datetime",
+        "PULocationID": "pickup_location_id",
+        "DOLocationID": "dropoff_location_id",
+        "passenger_count": "passenger_count",
+        "trip_distance": "trip_distance",
+    },
+
+    # FHV — passenger_count/trip_distance는 원본에 존재하지 않는다.
+    "fhv": {
+        "pickup_datetime": "pickup_datetime",
+        "dropOff_datetime": "dropoff_datetime",
+        "PUlocationID": "pickup_location_id",
+        "DOlocationID": "dropoff_location_id",
+    },
+
+    # High Volume FHV — trip_miles를 trip_distance로 통일, passenger_count는 원본에 없음.
+    "fhvhv": {
+        "pickup_datetime": "pickup_datetime",
+        "dropoff_datetime": "dropoff_datetime",
+        "PULocationID": "pickup_location_id",
+        "DOLocationID": "dropoff_location_id",
+        "trip_miles": "trip_distance",
+    },
+}
 
 
 def _raw_columns(taxi_type: str) -> dict:

@@ -3,7 +3,6 @@ from unittest.mock import patch
 
 import pytest
 
-from src.common import gold_snapshot
 from src.serving import nav_lookup
 
 # 순수 로직 테스트(배치 조회를 monkeypatch로 대체)는 RDS가 없어도 돈다 -
@@ -20,16 +19,19 @@ YESTERDAY = TODAY - timedelta(days=1)
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
-    """메모리 캐시/S3 스냅샷 로드 상태가 테스트 간에 새지 않도록 초기화한다.
-    LazySnapshot은 새 인스턴스를 대입하는 것만으로 loaded=False로 리셋된다."""
+    """메모리 캐시/S3 스냅샷 로드 상태가 테스트 간에 새지 않도록 초기화한다."""
     with patch.object(nav_lookup, "_new_york_today", return_value=TODAY_DATE):
         nav_lookup._memory_cache.clear()
-        nav_lookup._s3_snapshot = gold_snapshot.LazySnapshot("type1")
-        nav_lookup._length_snapshot = gold_snapshot.LazySnapshot("type2")
+        nav_lookup._s3_snapshot_loaded = False
+        nav_lookup._s3_snapshot = {}
+        nav_lookup._length_snapshot_loaded = False
+        nav_lookup._length_snapshot = {}
         yield
         nav_lookup._memory_cache.clear()
-        nav_lookup._s3_snapshot = gold_snapshot.LazySnapshot("type1")
-        nav_lookup._length_snapshot = gold_snapshot.LazySnapshot("type2")
+        nav_lookup._s3_snapshot_loaded = False
+        nav_lookup._s3_snapshot = {}
+        nav_lookup._length_snapshot_loaded = False
+        nav_lookup._length_snapshot = {}
 
 
 def test_time_to_bucket_rounds_down_to_30_minutes():

@@ -62,20 +62,9 @@ import psycopg2
 from psycopg2 import sql
 
 from src.common import gold_snapshot
-from src.common.config import (
-    GLOBAL_PARTITION_KEY,
-    SERVING_HARDCODED_DEFAULT_TYPE1_SECONDS,
-    SERVING_HARDCODED_DEFAULT_TYPE2_METERS,
-    SERVING_MEMORY_CACHE_MAX_SIZE,
-    SERVING_RDS_CONNECT_TIMEOUT_SECONDS,
-    SERVING_RDS_STATEMENT_TIMEOUT_MS,
-    SERVING_TABLE_TYPE1,
-    SERVING_TABLE_TYPE2,
-)
+from src.common.config import GLOBAL_PARTITION_KEY, SERVING_TABLE_TYPE1, SERVING_TABLE_TYPE2
 from src.common.db import batch_get_items, new_connection
 from src.common.logger import get_logger
-from src.common.tier_metrics import log_tier_summary
-from src.common.utils import unique_in_order
 
 logger = get_logger(__name__, log_to_file=True, log_file_stem="nav_lookup")
 
@@ -84,40 +73,37 @@ _NY_TZ = ZoneInfo("America/New_York")
 # RDS 자체 장애(연결 불가/응답 없음)를 얼마나 기다렸다가 fallback으로
 # 넘어갈지에 대한 값 - 같은 리전 안에서 정상 조회는 수십 ms 안에 끝나므로
 # 1초/1000ms는 그 대비 넉넉한 여유값이다. 정확한 실측(p50/p99)은 아직
-# 없어서 CloudWatch 데이터가 쌓이면 재조정이 필요하다 - 재배포 없이
-# 튜닝할 수 있도록 config.py(환경변수)에서 가져온다. db.py의 공유
-# 커넥션(배치 쓰기와 공용)과는 별도로 이 값만 쓰는 커넥션을 둔다 - 배치
-# 쓰기는 대량 upsert라 1초 넘게 걸리는 게 정상이라, 공유 커넥션에 이
-# 타임아웃을 걸면 정상 동작까지 실패로 처리된다.
-_RDS_CONNECT_TIMEOUT_SECONDS = SERVING_RDS_CONNECT_TIMEOUT_SECONDS
-_RDS_STATEMENT_TIMEOUT_MS = SERVING_RDS_STATEMENT_TIMEOUT_MS
+# 없어서 CloudWatch 데이터가 쌓이면 재조정이 필요하다(TODO 팀 검토 필요).
+# db.py의 공유 커넥션(배치 쓰기와 공용)과는 별도로 이 값만 쓰는 커넥션을
+# 둔다 - 배치 쓰기는 대량 upsert라 1초 넘게 걸리는 게 정상이라, 공유
+# 커넥션에 이 타임아웃을 걸면 정상 동작까지 실패로 처리된다.
+_RDS_CONNECT_TIMEOUT_SECONDS = 1
+_RDS_STATEMENT_TIMEOUT_MS = 1000
 
 # RDS/GLOBAL#DEFAULT/메모리/S3까지 전부 실패했을 때 쓰는 최후의 상수. 외부
 # 호출이 전혀 없어 어떤 저장소도 완전히 응답 불가능한 상황에서도 동작한다.
-# scripts/seed_rds_defaults.py의 기본값과 동일한 정성적 초안이라 둘 다
-# config.py(환경변수)로 재조정할 수 있게 뺐다.
-_HARDCODED_DEFAULTS = {
-    1: SERVING_HARDCODED_DEFAULT_TYPE1_SECONDS,
-    2: SERVING_HARDCODED_DEFAULT_TYPE2_METERS,
-}
+# TODO(팀 검토 필요): scripts/seed_rds_defaults.py의 기본값과 동일한
+# 정성적 초안.
+_HARDCODED_DEFAULTS = {1: 45, 2: 300}
 
 # RDS 장애 시 쓰는 메모리 캐시. (segment_id, time) -> 그 슬롯의 마지막 성공
 # 조회 행. 상한을 안 걸면 Lambda 인스턴스가 오래 켜져 있을 때 계속 커져서
 # OOM으로 함수 자체가 죽을 수 있어(관측값이 없는 것보다 훨씬 나쁜 실패)
 # 개수 상한 + 가장 오래된 것부터 제거한다.
-_MEMORY_CACHE_MAX_SIZE = SERVING_MEMORY_CACHE_MAX_SIZE
+_MEMORY_CACHE_MAX_SIZE = 50_000
 _memory_cache: dict[tuple[str, str], dict] = {}
 
 # S3 Gold 스냅샷은 이 프로세스(Lambda 웜 인스턴스)에서 처음 필요할 때 딱
 # 한 번만 통째로 읽는다 - 세그먼트마다 매번 S3를 부르면 RDS가 죽어있는
-# 동안 세그먼트 수만큼 S3 호출이 쌓이는 문제가 재발한다(gold_snapshot.
-# LazySnapshot 참고).
-_s3_snapshot = gold_snapshot.LazySnapshot("type1")
+# 동안 세그먼트 수만큼 S3 호출이 쌓이는 문제가 재발한다.
+_s3_snapshot_loaded = False
+_s3_snapshot: dict[str, dict[str, dict]] = {}
 
 # Type2(길이) 전용 S3 스냅샷 - segment_id당 값 하나뿐이라 위 type1
 # 스냅샷과 구조가 달라 별도로 둔다. GLOBAL_PARTITION_KEY 기본값도 이
 # 스냅샷 안에 자연히 포함돼 있다(src/nav_length/gold2.py 참고).
-_length_snapshot = gold_snapshot.LazySnapshot("type2")
+_length_snapshot_loaded = False
+_length_snapshot: dict[str, float] = {}
 
 # 서빙 전용 fast-fail RDS 커넥션. db.py의 공유 커넥션과 별개로 지연 생성해서
 # Lambda 웜스타트 사이에 재사용한다.
@@ -186,7 +172,7 @@ def _batch_fetch_type1_rows(segment_ids: list[str], table_name: str) -> dict[str
     if not segment_ids:
         return {}
 
-    unique_ids = unique_in_order(segment_ids)
+    unique_ids = list(dict.fromkeys(segment_ids))
     started = time.monotonic()
     try:
         conn = _get_fast_rds_connection()
@@ -279,13 +265,22 @@ def _remember_in_memory(segment_id: str, time_slot: str, row: dict) -> None:
         del _memory_cache[oldest_key]
 
 
+def _load_s3_snapshot_once() -> None:
+    global _s3_snapshot_loaded, _s3_snapshot
+    if _s3_snapshot_loaded:
+        return
+    _s3_snapshot = gold_snapshot.read_snapshot("type1")
+    _s3_snapshot_loaded = True
+
+
 def _resolve_from_fallback(segment_id: str, time_slot: str) -> tuple[int, str]:
     """RDS 자체가 응답 불가능할 때: 메모리 캐시 -> S3 스냅샷(최초 미스 때
     한 번만 로드) -> 코드 상수 순서로 내려간다."""
     row = _memory_cache.get((segment_id, time_slot))
 
     if row is None:
-        row = _s3_snapshot.get().get(segment_id, {}).get(time_slot)
+        _load_s3_snapshot_once()
+        row = _s3_snapshot.get(segment_id, {}).get(time_slot)
         if row is not None:
             _remember_in_memory(segment_id, time_slot, row)
 
@@ -343,6 +338,14 @@ def _lookup_global_default(table_name: str) -> int:
     return _HARDCODED_DEFAULTS[2]
 
 
+def _load_length_snapshot_once() -> None:
+    global _length_snapshot_loaded, _length_snapshot
+    if _length_snapshot_loaded:
+        return
+    _length_snapshot = gold_snapshot.read_snapshot("type2")
+    _length_snapshot_loaded = True
+
+
 def _resolve_length_values(segment_ids: list[str], table_name: str) -> list[int]:
     """Type2(길이)는 시간과 무관해 세그먼트당 값이 하나뿐이다 - 중복
     segment_id는 한 번만 조회해서 재사용해도 안전하다.
@@ -353,7 +356,7 @@ def _resolve_length_values(segment_ids: list[str], table_name: str) -> list[int]
     바로 넘어간다 - 이미 죽은 RDS에 재시도성 호출을 또 보낼 이유가
     없다. 스냅샷에도 없으면 스냅샷 자체에 실려있는 GLOBAL 값을 쓰고,
     스냅샷마저 실패하면 최후의 코드 상수로 떨어진다."""
-    unique_ids = unique_in_order(segment_ids)
+    unique_ids = list(dict.fromkeys(segment_ids))
     resolved: dict[str, int] = {}
     tier: dict[str, str] = {}
 
@@ -382,12 +385,12 @@ def _resolve_length_values(segment_ids: list[str], table_name: str) -> list[int]
                 tier[sid] = "global"
     except Exception:
         logger.exception(f"RDS batch_get_items 실패 -> S3 스냅샷으로 폴백: table={table_name}")
-        length_snapshot = _length_snapshot.get()
-        fallback_default = length_snapshot.get(GLOBAL_PARTITION_KEY, _HARDCODED_DEFAULTS[2])
+        _load_length_snapshot_once()
+        fallback_default = _length_snapshot.get(GLOBAL_PARTITION_KEY, _HARDCODED_DEFAULTS[2])
         for sid in unique_ids:
             if sid not in resolved:
-                resolved[sid] = round(length_snapshot.get(sid, fallback_default))
-                tier[sid] = "snapshot" if sid in length_snapshot else "hardcoded"
+                resolved[sid] = round(_length_snapshot.get(sid, fallback_default))
+                tier[sid] = "snapshot" if sid in _length_snapshot else "hardcoded"
     finally:
         logger.info(
             f"[nav_lookup] RDS type2 배치 조회 소요 시간: "
@@ -399,11 +402,13 @@ def _resolve_length_values(segment_ids: list[str], table_name: str) -> list[int]
     # global=RDS는 살아있지만 이 세그먼트 값이 없어 GLOBAL 기본값 사용,
     # snapshot=RDS 자체가 죽어 S3 스냅샷의 세그먼트별 값 사용,
     # hardcoded=스냅샷에도 없어 코드 상수 사용.
-    log_tier_summary(
-        logger,
-        "type2_fallback_tier_summary",
-        [tier.get(sid, "hardcoded") for sid in segment_ids],
-        ["rds", "global", "snapshot", "hardcoded"],
+    tier_counts = {"rds": 0, "global": 0, "snapshot": 0, "hardcoded": 0}
+    for sid in segment_ids:
+        tier_counts[tier.get(sid, "hardcoded")] += 1
+    logger.info(
+        f"[type2_fallback_tier_summary] rds={tier_counts['rds']} "
+        f"global={tier_counts['global']} snapshot={tier_counts['snapshot']} "
+        f"hardcoded={tier_counts['hardcoded']} total={len(segment_ids)}"
     )
 
     return [resolved[sid] for sid in segment_ids]
@@ -435,10 +440,8 @@ def _resolve_time_values(segment_ids: list[str], table_name: str, time_str: str)
     elapsed_seconds = 0
     # Grafana 대시보드의 fallback 히트율(fresh/avg/hardcoded 비율) 집계용 -
     # 세그먼트마다 로그를 남기면 요청당 수백 줄까지 늘어날 수 있어서, 요청
-    # 하나당 요약 한 줄만 마지막에 남긴다(log_tier_summary 호출부 참고).
-    # 같은 segment_id가 경로에 두 번 나와도 누적시각이 달라 tier가 다를 수
-    # 있어(docstring 참고) segment_id별 dict가 아니라 등장 순서대로 쌓는다.
-    tiers: list[str] = []
+    # 하나당 요약 한 줄만 마지막에 남긴다.
+    tier_counts = {"fresh": 0, "avg": 0, "hardcoded": 0}
 
     for sid in segment_ids:
         lookup_time = _add_seconds(time_str, elapsed_seconds)
@@ -458,9 +461,13 @@ def _resolve_time_values(segment_ids: list[str], table_name: str, time_str: str)
                 # 않고 곧장 코드 상수로 간다.
                 value, tier = _HARDCODED_DEFAULTS[1], "hardcoded"
 
-        tiers.append(tier)
+        tier_counts[tier] += 1
         values.append(value)
         elapsed_seconds += value
 
-    log_tier_summary(logger, "fallback_tier_summary", tiers, ["fresh", "avg", "hardcoded"], extra="type=1")
+    logger.info(
+        f"[fallback_tier_summary] type=1 fresh={tier_counts['fresh']} "
+        f"avg={tier_counts['avg']} hardcoded={tier_counts['hardcoded']} "
+        f"total={len(segment_ids)}"
+    )
     return values

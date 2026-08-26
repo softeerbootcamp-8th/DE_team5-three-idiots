@@ -2,18 +2,18 @@ from unittest.mock import patch
 
 import pytest
 
-from src.common import gold_snapshot
 from src.toll import serving
 from src.toll.serving import get_toll_value, get_toll_values
 
 
 @pytest.fixture(autouse=True)
 def _clear_snapshot_cache():
-    """모듈 전역 스냅샷 캐시가 테스트 간에 새지 않도록 초기화한다.
-    LazySnapshot은 새 인스턴스를 대입하는 것만으로 loaded=False로 리셋된다."""
-    serving._snapshot = gold_snapshot.LazySnapshot("type4")
+    """모듈 전역 스냅샷 캐시가 테스트 간에 새지 않도록 초기화한다."""
+    serving._snapshot_loaded = False
+    serving._snapshot = {}
     yield
-    serving._snapshot = gold_snapshot.LazySnapshot("type4")
+    serving._snapshot_loaded = False
+    serving._snapshot = {}
 
 
 def test_get_toll_values_returns_values_in_order():

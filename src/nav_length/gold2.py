@@ -80,11 +80,10 @@ def write_to_rds(items: list[dict], table_name: str) -> int:
     replace_table_snapshot(table_name, items, key_columns=SERVING_TABLE_TYPE2_KEY_COLUMNS)
     logger.info(f"[nav_length_gold2] RDS 스냅샷 교체 완료: table={table_name} count={len(items)}")
 
-    gold_snapshot.export_best_effort(
-        "type2",
-        lambda: {item["segment_id"]: item["value"] for item in items},
-        logger,
-        "nav_length_gold2",
-    )
+    try:
+        snapshot = {item["segment_id"]: item["value"] for item in items}
+        gold_snapshot.write_snapshot("type2", snapshot)
+    except Exception:
+        logger.exception("[nav_length_gold2] S3 Gold 스냅샷 갱신 실패(RDS 쓰기 자체는 성공)")
 
     return len(items)

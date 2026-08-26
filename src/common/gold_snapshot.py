@@ -26,12 +26,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from cloudpathlib import S3Path
 
-from src.common.config import (
-    AWS_REGION,
-    GOLD_CACHE_DIR,
-    GOLD_SNAPSHOT_S3_CONNECT_TIMEOUT_SECONDS,
-    GOLD_SNAPSHOT_S3_READ_TIMEOUT_SECONDS,
-)
+from src.common.config import AWS_REGION, GOLD_CACHE_DIR
 from src.common.logger import get_logger
 
 logger = get_logger(__name__, log_to_file=True, log_file_stem="gold_snapshot")
@@ -40,10 +35,10 @@ logger = get_logger(__name__, log_to_file=True, log_file_stem="gold_snapshot")
 # boto3 기본값(연결/읽기 각 60초)을 그대로 두면 이 폴백 계층 자체가
 # "무조건 응답" 원칙을 못 지킨다(nav-api Lambda 전체 제한 시간이 10초).
 # 정상 상황에서 GetObject는 보통 수백 ms 이내로 끝나므로 1초는 넉넉한
-# 여유값이다 - 정확한 실측(p50/p99) 전까지의 시작값이라 재조정이 필요할
-# 수 있어 config.py(환경변수)에서 가져온다.
-_S3_CONNECT_TIMEOUT_SECONDS = GOLD_SNAPSHOT_S3_CONNECT_TIMEOUT_SECONDS
-_S3_READ_TIMEOUT_SECONDS = GOLD_SNAPSHOT_S3_READ_TIMEOUT_SECONDS
+# 여유값이다 - 정확한 실측(p50/p99) 전까지의 시작값이라 재조정
+# 필요(TODO 팀 검토 필요).
+_S3_CONNECT_TIMEOUT_SECONDS = 1
+_S3_READ_TIMEOUT_SECONDS = 1
 
 # 지연 생성 후 재사용한다(Lambda 웜스타트 사이에도) - 요청마다 클라이언트를
 # 새로 만들 필요가 없다.
@@ -93,49 +88,6 @@ def write_snapshot(type_name: str, snapshot: dict[str, dict]) -> None:
         path.write_text(payload)
 
     logger.info(f"[gold_snapshot] {type_name} 스냅샷 저장 완료: {len(snapshot)}개 세그먼트 -> {path}")
-
-
-class LazySnapshot:
-    """S3 Gold 스냅샷을 프로세스당 최초 1회만 읽어 메모리에 캐싱한다.
-
-    서빙 쪽(nav_lookup.py/toll/serving.py/api.py)이 각자 "_xxx_loaded bool +
-    _xxx dict 전역변수 + _load_xxx_once() 함수" 형태로 반복 구현하던 걸
-    공용화한 것 - 세그먼트마다 매번 새로 읽으면 RDS가 죽어있는 동안
-    세그먼트 수만큼 S3 호출이 쌓이는 문제가 재발하므로(Lambda 웜
-    인스턴스에서 최초 미스 때 한 번만 로드해 재사용해야 함), 그 lazy-load
-    자체는 타입마다 동일한 모양이라 여기로 뽑았다. fallback 판단(어떤
-    순서로 어떤 값을 쓸지)은 호출부마다 다르므로 그대로 남겨둔다."""
-
-    def __init__(self, type_name: str) -> None:
-        self._type_name = type_name
-        self._loaded = False
-        self._data: dict[str, dict] = {}
-
-    def get(self) -> dict[str, dict]:
-        if not self._loaded:
-            self._data = read_snapshot(self._type_name)
-            self._loaded = True
-        return self._data
-
-
-def export_best_effort(type_name: str, build_snapshot, logger, log_prefix: str) -> None:
-    """Gold 파이프라인이 RDS 쓰기 성공 후 S3 스냅샷을 최선 노력(best-effort)으로
-    갱신한다 - nav_length/gold2.py, nav_time/gold2.py, toll/gold.py 세
-    write_to_rds류 함수가 각자 구현하던 동일한 try/except/log 블록을
-    공용화한 것. 스냅샷 갱신 자체가 실패해도 RDS 쓰기는 이미 끝난 뒤라
-    파이프라인을 실패시키지 않는다(다음 정상 실행 때 다시 시도되면
-    충분하다) - 그래서 예외를 여기서 삼키고 로깅만 한다.
-
-    build_snapshot은 인자 없는 콜러블이다 - 단순 dict 컴프리헨션(nav_length/
-    toll)이 아니라 RDS를 다시 조회해서 원본을 뽑는 경우(nav_time/gold2.py의
-    _export_snapshot)도 있어서, 그 빌드 단계 자체의 실패도 이 함수의
-    best-effort 범위 안에 포함시킨다(원본 구현이 try 블록 안에서 빌드까지
-    같이 하던 것과 동일한 범위)."""
-    try:
-        snapshot = build_snapshot()
-        write_snapshot(type_name, snapshot)
-    except Exception:
-        logger.exception(f"[{log_prefix}] S3 Gold 스냅샷 갱신 실패(RDS 쓰기 자체는 성공)")
 
 
 def read_snapshot(type_name: str) -> dict[str, dict]:

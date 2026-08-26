@@ -1,21 +1,17 @@
-"""Type3(승차 수) 서빙 조회 라이브러리.
-
-원래는 이 모듈 자체가 독립 FastAPI 앱(및 Lambda)이었지만, 여러 타입의
-Lambda를 nav_api.py 하나로 통합하면서(docs/superpowers/plans/
-2026-08-23-unified-navigation-api.md) 실제 배포는 src/serving/lambda_handler.py
--> nav_api.py 경로만 쓰게 됐다. 이 모듈은 이제 nav_api.py가 가져다 쓰는
-get_type3_values() 조회 로직만 담은 라이브러리다 - 자체 FastAPI 앱/엔드포인트는
-어디서도 실행되지 않아 제거했다(2026-08-26).
-"""
+"""내비게이션이 segment별 비용 값을 조회하는 FastAPI."""
 
 from __future__ import annotations
 
 import re
 import time
 from datetime import datetime
+from typing import Annotated, Literal
 
 import psycopg2
 from psycopg2 import sql
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import Field, RootModel, field_validator
 
 from src.common import gold_snapshot
 from src.common.config import (
@@ -24,36 +20,36 @@ from src.common.config import (
     RDS_PASSWORD,
     RDS_PORT,
     RDS_USER,
-    SERVING_RDS_CONNECT_TIMEOUT_SECONDS,
-    SERVING_RDS_STATEMENT_TIMEOUT_MS,
     SERVING_TABLE_TYPE3,
     TLC_TYPE3_DOW_NAMES,
-    TYPE3_RDS_BATCH_SIZE,
+    TLC_TYPE3_ID,
 )
 from src.common.logger import get_logger
-from src.common.tier_metrics import log_tier_summary
-from src.common.utils import unique_in_order
 
 
 logger = get_logger(__name__, log_to_file=True, log_file_stem="navigation_api")
 
+app = FastAPI(title="Navigation Segment Value API", version="1.0.0")
+
+TYPE3_ID = TLC_TYPE3_ID
 WEEKDAY_NAMES = TLC_TYPE3_DOW_NAMES
 # Type3 RDS는 (segment_id, dow, time)이 복합키인 flat 테이블이다(2026-08-24
 # 스키마 개편 - 예전엔 세그먼트당 row 1개에 336개 값을 JSONB로 중첩했었다).
 # 한 요청 안에서 dow/time은 요청 시각 하나로 고정되므로, segment_id
 # 여러 개를 한 번에 조회할 때도 dow/time 조건은 쿼리에 딱 한 번만 걸면 된다.
-TYPE3_BATCH_SIZE = TYPE3_RDS_BATCH_SIZE
+TYPE3_BATCH_SIZE = 100
+MAX_SEGMENTS_PER_REQUEST = 1_000
 MISSING_VALUE = 0.0
 
 # RDS 커넥션 타임아웃/쿼리 타임아웃: 이 API는 Lambda 콜드/웜스타트 전체
-# 시간 예산이 빠듯해서 RDS 커넥션/쿼리가 오래 걸리면 기다리는 대신 빨리
-# 실패하고 fallback(S3 스냅샷/기본값)으로 넘어가야 한다. statement_timeout은
-# 커넥션 세션 옵션으로 서버 쪽에 강제한다 — psycopg2 자체엔 botocore
-# Config의 read_timeout과 동등한 클라이언트 옵션이 없어서, 쿼리 실행 시간
-# 상한은 Postgres 서버가 직접 끊게 한다. nav_lookup.py(type1/2)와 같은
-# RDS 인스턴스를 상대로 같은 이유로 쓰는 값이라 config.py에서 공유한다.
-RDS_CONNECT_TIMEOUT_SECONDS = SERVING_RDS_CONNECT_TIMEOUT_SECONDS
-RDS_STATEMENT_TIMEOUT_MS = SERVING_RDS_STATEMENT_TIMEOUT_MS
+# 시간 예산이 빠듯해서(nav_lookup.py의 _TIME_BUDGET_SECONDS 참고) RDS
+# 커넥션/쿼리가 오래 걸리면 기다리는 대신 빨리 실패하고 fallback(S3
+# 스냅샷/기본값)으로 넘어가야
+# 한다. statement_timeout은 커넥션 세션 옵션으로 서버 쪽에 강제한다 —
+# psycopg2 자체엔 botocore Config의 read_timeout과 동등한 클라이언트
+# 옵션이 없어서, 쿼리 실행 시간 상한은 Postgres 서버가 직접 끊게 한다.
+RDS_CONNECT_TIMEOUT_SECONDS = 1
+RDS_STATEMENT_TIMEOUT_MS = 1_000
 
 # RDS 자체가 응답 불가능할 때 쓰는 S3 스냅샷 2개(src/tlc/gold2.py/
 # spark_jobs/tlc_pipeline_job.py의 _export_type3_snapshot이 RDS 쓰기
@@ -63,8 +59,41 @@ RDS_STATEMENT_TIMEOUT_MS = SERVING_RDS_STATEMENT_TIMEOUT_MS
 # 가능함). 이 스냅샷은 프로세스당 최초 1회만 S3에서 읽어 메모리에 보관한다
 # (재다운로드 방지용 로딩 캐시 - "최근 RDS 성공값"을 기억하는 캐시와는
 # 성격이 다르다).
-_type3_zone_snapshot = gold_snapshot.LazySnapshot("type3_zone")
-_type3_mapping_snapshot = gold_snapshot.LazySnapshot("type3_mapping")
+_type3_snapshot_loaded = False
+_type3_zone_snapshot: dict[str, float] = {}
+_type3_mapping_snapshot: dict[str, int] = {}
+
+SegmentId = Annotated[str, Field(min_length=1)]
+SegmentIds = Annotated[
+    list[SegmentId],
+    Field(min_length=1, max_length=MAX_SEGMENTS_PER_REQUEST),
+]
+
+
+class NavigationValuesRequest(
+    RootModel[tuple[SegmentIds, Literal[TYPE3_ID], datetime]]
+):
+    """``[[segment_id...], 3, 날짜시간]`` 요청 모델."""
+
+    @field_validator("root")
+    @classmethod
+    def normalize_segment_ids(cls, value):
+        segment_ids, type_id, requested_at = value
+        normalized = [segment_id.strip() for segment_id in segment_ids]
+        if any(not segment_id for segment_id in normalized):
+            raise ValueError("segment_id는 빈 값이 아닌 문자열이어야 합니다")
+        return normalized, type_id, requested_at
+
+
+@app.exception_handler(Exception)
+async def log_unexpected_exception(request: Request, exc: Exception):
+    logger.error(
+        "처리되지 않은 API 예외: %s %s",
+        request.method,
+        request.url.path,
+        exc_info=exc,
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 
 def _weekday_and_bucket(requested_at: datetime) -> tuple[str, str]:
@@ -113,22 +142,24 @@ def get_db_connection():
     return _db_connection
 
 
+def _load_type3_snapshot_once() -> None:
+    global _type3_snapshot_loaded, _type3_zone_snapshot, _type3_mapping_snapshot
+    if _type3_snapshot_loaded:
+        return
+    _type3_zone_snapshot = gold_snapshot.read_snapshot("type3_zone")
+    _type3_mapping_snapshot = gold_snapshot.read_snapshot("type3_mapping")
+    _type3_snapshot_loaded = True
+
+
 def _resolve_from_zone_snapshot(segment_id: str, dow: str, bucket: str) -> float | None:
     """Zone 스냅샷 + segment→zone 매핑으로 값을 재구성한다. 매핑에 그
     segment가 없거나 zone 스냅샷에 그 (zone, dow, bucket) 조합이 없으면
-    None을 돌려줘서 호출부가 최종 기본값(0)으로 내려가게 한다.
-
-    두 스냅샷의 .get()을 항상 함께 먼저 부른다(먼저 mapping만 보고
-    zone_id가 없으면 조기 반환하지 않는다) - 두 파일은 항상 함께
-    최초 1회 로드되어야 하는 짝이라, 매핑 미스가 잦은 요청 초반에
-    zone 스냅샷 로드가 계속 미뤄지다 나중에서야 불쑥 S3를 부르는
-    타이밍 편차를 없앤다."""
-    mapping = _type3_mapping_snapshot.get()
-    zone_snapshot = _type3_zone_snapshot.get()
-    zone_id = mapping.get(segment_id)
+    None을 돌려줘서 호출부가 최종 기본값(0)으로 내려가게 한다."""
+    _load_type3_snapshot_once()
+    zone_id = _type3_mapping_snapshot.get(segment_id)
     if zone_id is None:
         return None
-    return zone_snapshot.get(f"{zone_id}#{dow}#{bucket}")
+    return _type3_zone_snapshot.get(f"{zone_id}#{dow}#{bucket}")
 
 
 def _fallback_value(segment_id: str, dow: str, bucket: str) -> tuple[float, str]:
@@ -139,6 +170,10 @@ def _fallback_value(segment_id: str, dow: str, bucket: str) -> tuple[float, str]
     if value is not None:
         return value, "snapshot"
     return MISSING_VALUE, "hardcoded"
+
+
+def _unique_in_order(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
 
 
 _TABLE_NAME_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*$")
@@ -191,7 +226,7 @@ def get_type3_values(
         if not resolved_table:
             raise RuntimeError("SERVING_TABLE_TYPE3 환경변수가 필요합니다")
         connection = conn or get_db_connection()
-        unique_segments = unique_in_order(segment_ids)
+        unique_segments = _unique_in_order(segment_ids)
         start = time.perf_counter()
         for offset in range(0, len(unique_segments), TYPE3_BATCH_SIZE):
             chunk = unique_segments[offset:offset + TYPE3_BATCH_SIZE]
@@ -220,20 +255,38 @@ def get_type3_values(
     if missing:
         logger.warning("Type 3 조회 누락: %s/%s", missing, len(segment_ids))
 
-    tiers: list[str] = []
+    tier_counts = {"rds": 0, "snapshot": 0, "hardcoded": 0}
     values = []
     for segment_id in segment_ids:
         if segment_id in found:
-            tiers.append("rds")
+            tier_counts["rds"] += 1
             values.append(found[segment_id])
         else:
             value, tier = _fallback_value(segment_id, dow, bucket)
-            tiers.append(tier)
+            tier_counts[tier] += 1
             values.append(value)
 
     # 요청당 한 번만 남긴다(세그먼트별로 남기면 요청 하나에 수백 줄이 될 수
     # 있음) - CloudWatch Logs Insights가 이 로그를 집계해서 Grafana의
     # "Type3 fallback 계층 비율" 패널을 그린다.
-    log_tier_summary(logger, "type3_fallback_tier_summary", tiers, ["rds", "snapshot", "hardcoded"])
+    logger.info(
+        f"[type3_fallback_tier_summary] rds={tier_counts['rds']} "
+        f"snapshot={tier_counts['snapshot']} "
+        f"hardcoded={tier_counts['hardcoded']} total={len(segment_ids)}"
+    )
 
     return values
+
+
+@app.get("/health")
+def health() -> dict:
+    return {
+        "status": "ok",
+        "rds_table_configured": bool(SERVING_TABLE_TYPE3),
+    }
+
+
+@app.post("/api/navigation/values", response_model=list[float])
+def navigation_values(payload: NavigationValuesRequest) -> list[float]:
+    segment_ids, _, requested_at = payload.root
+    return get_type3_values(segment_ids, requested_at)

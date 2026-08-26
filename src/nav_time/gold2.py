@@ -41,11 +41,7 @@ from pyspark.sql.functions import (
 )
 
 from src.common import gold_snapshot
-from src.common.config import (
-    BUCKET_MINUTES,
-    NAV_TIME_AVG_SMOOTHING_WINDOW,
-    SERVING_TABLE_TYPE1_KEY_COLUMNS,
-)
+from src.common.config import BUCKET_MINUTES, SERVING_TABLE_TYPE1_KEY_COLUMNS
 from src.common.db import batch_get_items, batch_write_items, get_shared_connection
 from src.common.logger import get_logger
 
@@ -59,9 +55,8 @@ _SECONDS_PER_HOUR = 3600.0
 # 갱신됐는지에 대한 정직한 기록), 평균 공식에서 나누는 수는 이 값에서
 # 멈춘다 - 안 그러면 배치가 수백 개 쌓였을 때 새 값 하나의 영향력이
 # 1/수백로 사라져서, 도로 공사 등으로 실제 통행시간이 바뀌어도 avg가
-# 거의 반응하지 않게 된다. 정성적 초안이라 재조정할 수 있게
-# config.py(환경변수)에서 가져온다.
-AVG_SMOOTHING_WINDOW = NAV_TIME_AVG_SMOOTHING_WINDOW
+# 거의 반응하지 않게 된다.
+AVG_SMOOTHING_WINDOW = 10
 
 
 def _bucket_column():
@@ -264,8 +259,10 @@ def write_to_rds(items: list[dict], table_name: str) -> int:
     batch_write_items(table_name, items, key_columns=SERVING_TABLE_TYPE1_KEY_COLUMNS)
     logger.info(f"[nav_time_gold2] RDS upsert 완료: table={table_name} count={len(items)}")
 
-    gold_snapshot.export_best_effort(
-        "type1", lambda: _export_snapshot(table_name), logger, "nav_time_gold2"
-    )
+    try:
+        snapshot = _export_snapshot(table_name)
+        gold_snapshot.write_snapshot("type1", snapshot)
+    except Exception:
+        logger.exception("[nav_time_gold2] S3 Gold 스냅샷 갱신 실패(RDS 쓰기 자체는 성공)")
 
     return len(items)

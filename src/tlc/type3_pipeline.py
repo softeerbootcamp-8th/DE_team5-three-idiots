@@ -206,11 +206,7 @@ def validate_type3_staged_records(stage_result: dict) -> dict:
     )
 
 
-@task(
-    pool="tlc_ingest_pool",
-    pool_slots=17,
-    outlets=[TLC_TYPE3_GOLD2_READY],
-)
+@task(pool="tlc_ingest_pool", pool_slots=17)
 def publish_type3_daily_records(validated_stage: dict) -> dict:
     """EMR에서 검증된 날짜 파티션을 운영 경로에 반영하고, 성공한 경우에만
     serving DAG가 구독하는 tlc_type3_gold2_ready Asset을 발행한다."""

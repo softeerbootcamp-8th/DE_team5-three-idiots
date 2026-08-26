@@ -136,12 +136,11 @@ def write_gold_items(items: list[dict]) -> None:
     # segment_id별 값 하나뿐이라 시간 슬롯 분할이 필요 없다(type1과 다른
     # 이유는 nav_time/gold2.py 참고). 스냅샷 갱신 자체가 실패해도 RDS
     # 쓰기는 이미 끝난 뒤라 파이프라인을 실패시키지 않는다.
-    gold_snapshot.export_best_effort(
-        "type4",
-        lambda: {item["segment_id"]: item["value"] for item in items},
-        logger,
-        "toll_gold",
-    )
+    try:
+        snapshot = {item["segment_id"]: item["value"] for item in items}
+        gold_snapshot.write_snapshot("type4", snapshot)
+    except Exception:
+        logger.exception("[toll_gold] S3 스냅샷 갱신 실패(RDS 쓰기 자체는 성공)")
 
 
 def build_and_write(

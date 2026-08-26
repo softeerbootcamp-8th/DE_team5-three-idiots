@@ -2,8 +2,8 @@ from datetime import datetime
 from unittest.mock import patch
 
 import pytest
+from fastapi.testclient import TestClient
 
-from src.common import gold_snapshot
 from src.serving import api
 
 
@@ -58,14 +58,15 @@ class FakeConnection:
 
 @pytest.fixture(autouse=True)
 def reset_type3_state():
-    """LazySnapshot은 새 인스턴스를 대입하는 것만으로 loaded=False로 리셋된다."""
     api._db_connection = None
-    api._type3_zone_snapshot = gold_snapshot.LazySnapshot("type3_zone")
-    api._type3_mapping_snapshot = gold_snapshot.LazySnapshot("type3_mapping")
+    api._type3_snapshot_loaded = False
+    api._type3_zone_snapshot = {}
+    api._type3_mapping_snapshot = {}
     yield
     api._db_connection = None
-    api._type3_zone_snapshot = gold_snapshot.LazySnapshot("type3_zone")
-    api._type3_mapping_snapshot = gold_snapshot.LazySnapshot("type3_mapping")
+    api._type3_snapshot_loaded = False
+    api._type3_zone_snapshot = {}
+    api._type3_mapping_snapshot = {}
 
 
 def test_db_connection_uses_short_operational_timeouts(monkeypatch):
@@ -93,6 +94,14 @@ def test_db_connection_uses_short_operational_timeouts(monkeypatch):
     kwargs = calls[0]
     assert kwargs["connect_timeout"] == 1
     assert "statement_timeout=1000" in kwargs["options"]
+
+
+def test_navigation_request_is_validated_and_normalized_by_pydantic():
+    request = api.NavigationValuesRequest.model_validate(
+        [[" 0077356 "], 3, "2026-08-21T12:00:00"]
+    )
+
+    assert request.root == (["0077356"], 3, datetime(2026, 8, 21, 12, 0))
 
 
 def test_get_type3_values_batches_and_preserves_input_order():
@@ -213,3 +222,32 @@ def test_get_type3_values_loads_snapshot_only_once_per_process():
 
     # zone + 매핑 2개 파일 -> 최초 1회씩(총 2번), 그 이후 재호출에서는 안 늘어난다.
     assert mock_read.call_count == 2
+
+
+def test_navigation_values_accepts_agreed_array_request(monkeypatch):
+    monkeypatch.setattr(
+        api,
+        "get_type3_values",
+        lambda segment_ids, requested_at: [18.5, 7.0],
+    )
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/navigation/values",
+        json=[["0077356", "0088421"], 3, "2026-08-21T12:00:00"],
+    )
+
+    assert response.status_code == 200
+    assert response.json() == [18.5, 7.0]
+
+
+def test_navigation_values_rejects_unsupported_type():
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/navigation/values",
+        json=[["0077356"], 4, "2026-08-21T12:00:00"],
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "literal_error"

@@ -85,24 +85,14 @@ RDS_PASSWORD = os.getenv("RDS_PASSWORD")
 # TLC Spark 잡(build_silver 등)을 Airflow worker 안에서 SparkSession으로
 # 직접 여는 대신 EMR Serverless에 제출한다 — spark-master/worker 컨테이너를
 # EC2에 상주시키지 않고, 무거운 컴퓨트를 온디맨드로 분리하기 위함
-# (src/common/emr_serverless.py 참고). 잡 제출(boto3 emr-serverless) 자체는
-# 실제 AWS 계정이 있어야만 가능하지만, 업로드 대상 경로(EMR_JOBS_DIR)는
-# APP_ENV=local일 때 로컬 디스크를 쓰도록 분기해뒀다
-# (emr_serverless.py의 isinstance(dest, Path) 분기 참고 — 테스트/로컬
-# 개발에서 실제 S3 업로드 없이 번들 생성 로직을 검증할 수 있게 하기 위함).
+# (src/common/emr_serverless.py 참고). APP_ENV=local 로컬 개발 모드는 아직
+# 이 경로를 지원하지 않는다 — EMR Serverless는 실제 AWS 계정이 있어야
+# 제출 가능해서 로컬 대체 수단이 없다.
 
 EMR_APPLICATION_ID = os.getenv("EMR_APPLICATION_ID")
 EMR_JOB_ROLE_ARN = os.getenv("EMR_JOB_ROLE_ARN")
 
-if APP_ENV == "local":
-    EMR_JOBS_DIR = PROJECT_ROOT / "data" / "emr-jobs"
-else:
-    EMR_JOBS_DIR = S3Path(f"s3://{S3_BUCKET_DATA}/emr-jobs")
-
-# EMR Serverless job이 spark.archives로 실어가는 패키징된 파이썬 venv
-# (pandas/geopandas/shapely/pyproj 등 서드파티 의존성). requirements.txt가
-# 바뀌면 scripts/package_emr_dependencies.sh로 다시 만들어 올려야 한다.
-EMR_PYTHON_ENV_S3_PATH = EMR_JOBS_DIR / "python-env" / "pyspark_deps.tar.gz"
+EMR_JOBS_DIR = S3Path(f"s3://{S3_BUCKET_DATA}/emr-jobs")
 
 # segment_time/tlc_ingest_daily/tlc_type3_serving_daily 세 DAG가 EMR
 # Serverless 계정 전체 vCPU 쿼터(64, Service Quotas 콘솔 값)를 동시에 나눠
@@ -243,59 +233,25 @@ GLOBAL_PARTITION_KEY = "GLOBAL"
 BUCKET_MINUTES = 30
 
 # ==========================
-# 서빙 API 튜닝 설정
+# EMR Serverless (Spark job 실행) 설정
 # ==========================
 #
-# 아래 값은 전부 nav_lookup.py/api.py/gold_snapshot.py/nav_time/gold2.py에
-# 각각 코드 상수로 박혀 있던 것들이다 - 값 하나 조정하려면 재배포가
-# 필요했다("TODO 팀 검토 필요" 주석들이 그 흔적, 아직 정확한 실측(p50/p99)
-# 전의 정성적 초안이라 재조정 가능성이 높다). 환경변수로 빼서 배포 없이
-# 튜닝할 수 있게 한다 - 기본값은 기존 코드 상수와 동일해서 지금 당장
-# 동작이 바뀌진 않는다.
+# Airflow worker 프로세스 안에서 SparkSession을 직접 여는 대신, 변환 로직을
+# 담은 스크립트(spark_jobs/*.py)를 EMR Serverless에 제출하고 완료를 기다린다
+# (src/common/emr_serverless.py 참고).
 
-# RDS 자체 장애(연결 불가/응답 없음)를 얼마나 기다렸다가 fallback으로
-# 넘어갈지 - 같은 리전 안에서 정상 조회는 수십 ms 안에 끝나므로
-# 1초/1000ms는 그 대비 넉넉한 여유값이다. nav_lookup.py(type1/2)와
-# api.py(type3)가 같은 RDS 인스턴스를 상대로 같은 이유로 쓰는 값이라
-# 하나로 공유한다.
-SERVING_RDS_CONNECT_TIMEOUT_SECONDS = int(
-    os.getenv("SERVING_RDS_CONNECT_TIMEOUT_SECONDS", "1")
-)
-SERVING_RDS_STATEMENT_TIMEOUT_MS = int(os.getenv("SERVING_RDS_STATEMENT_TIMEOUT_MS", "1000"))
+EMR_APPLICATION_ID = os.getenv("EMR_APPLICATION_ID")
+EMR_JOB_ROLE_ARN = os.getenv("EMR_JOB_ROLE_ARN")
 
-# RDS 장애 시 nav_lookup.py가 쓰는 인메모리 캐시((segment_id, time) ->
-# 마지막 성공 조회 행) 상한 - Lambda 인스턴스가 오래 켜져 있을 때 계속
-# 커져서 OOM으로 함수 자체가 죽는 것(관측값이 없는 것보다 훨씬 나쁜 실패)을
-# 막는다.
-SERVING_MEMORY_CACHE_MAX_SIZE = int(os.getenv("SERVING_MEMORY_CACHE_MAX_SIZE", "50000"))
+if APP_ENV == "local":
+    EMR_JOBS_DIR = PROJECT_ROOT / "data" / "emr-jobs"
+else:
+    EMR_JOBS_DIR = S3Path(f"s3://{S3_BUCKET_DATA}/emr-jobs")
 
-# RDS/메모리 캐시/S3 스냅샷까지 전부 실패했을 때 쓰는 최후의 상수 -
-# scripts/seed_rds_defaults.py의 기본값과 동일한 정성적 초안.
-# type1=통과시간(초), type2=길이(m).
-SERVING_HARDCODED_DEFAULT_TYPE1_SECONDS = int(
-    os.getenv("SERVING_HARDCODED_DEFAULT_TYPE1_SECONDS", "45")
-)
-SERVING_HARDCODED_DEFAULT_TYPE2_METERS = int(
-    os.getenv("SERVING_HARDCODED_DEFAULT_TYPE2_METERS", "300")
-)
-
-# api.py(type3)가 segment_id 목록을 RDS IN 절에 몇 개씩 끊어 보낼지, 요청
-# 하나가 받을 수 있는 segment_id 최대 개수.
-TYPE3_RDS_BATCH_SIZE = int(os.getenv("TYPE3_RDS_BATCH_SIZE", "100"))
-MAX_SEGMENTS_PER_REQUEST = int(os.getenv("MAX_SEGMENTS_PER_REQUEST", "1000"))
-
-# S3 Gold 스냅샷(gold_snapshot.py) 읽기/쓰기 타임아웃 - 이 폴백 계층
-# 자체가 "무조건 응답" 원칙을 지키려면 boto3 기본값(60초)을 쓸 수 없다.
-GOLD_SNAPSHOT_S3_CONNECT_TIMEOUT_SECONDS = int(
-    os.getenv("GOLD_SNAPSHOT_S3_CONNECT_TIMEOUT_SECONDS", "1")
-)
-GOLD_SNAPSHOT_S3_READ_TIMEOUT_SECONDS = int(
-    os.getenv("GOLD_SNAPSHOT_S3_READ_TIMEOUT_SECONDS", "1")
-)
-
-# type1 세그먼트 평균(avg) 증분 갱신 시 새 값의 최대 반영 비중을
-# 1/NAV_TIME_AVG_SMOOTHING_WINDOW로 제한한다(nav_time/gold2.py 참고).
-NAV_TIME_AVG_SMOOTHING_WINDOW = int(os.getenv("NAV_TIME_AVG_SMOOTHING_WINDOW", "10"))
+# EMR Serverless job이 spark.archives로 실어가는 패키징된 파이썬 venv
+# (pandas/geopandas/shapely/pyproj 등 서드파티 의존성). requirements.txt가
+# 바뀌면 scripts/package_emr_dependencies.sh로 다시 만들어 올려야 한다.
+EMR_PYTHON_ENV_S3_PATH = EMR_JOBS_DIR / "python-env" / "pyspark_deps.tar.gz"
 
 # ==========================
 # 속도(speed) - LION 매핑 설정

@@ -15,15 +15,22 @@ from __future__ import annotations
 from src.common import db, gold_snapshot
 from src.common.config import SERVING_TABLE_TYPE4
 from src.common.logger import get_logger
-from src.common.tier_metrics import log_tier_summary
-from src.common.utils import unique_in_order
 
 logger = get_logger(__name__, log_to_file=True, log_file_stem="toll_serving")
 
 # RDS 자체가 응답 불가능할 때 대신 쓰는 S3 스냅샷(gold.py의 write_gold_items가
 # RDS 쓰기 성공 시마다 갱신). Lambda 웜 인스턴스에서 최초 1회만 로드해서
 # 재사용한다 - 통행료 대상 segment만이라 전체를 통째로 담아도 작다.
-_snapshot = gold_snapshot.LazySnapshot("type4")
+_snapshot_loaded = False
+_snapshot: dict[str, float] = {}
+
+
+def _load_snapshot_once() -> None:
+    global _snapshot_loaded, _snapshot
+    if _snapshot_loaded:
+        return
+    _snapshot = gold_snapshot.read_snapshot("type4")
+    _snapshot_loaded = True
 
 
 def get_toll_value(segment_id: str) -> float:
@@ -45,7 +52,7 @@ def get_toll_values(segment_ids: list[str]) -> list[float]:
     RDS가 멀쩡한데 이미 없다고 확인된 값에 예전 스냅샷을 섞으면 두 실패
     모드(값이 없음 vs RDS가 죽음)가 헷갈린다."""
 
-    unique_ids = unique_in_order(segment_ids)
+    unique_ids = list(dict.fromkeys(segment_ids))
     keys = [{"segment_id": segment_id} for segment_id in unique_ids]
     tier: dict[str, str] = {}
 
@@ -63,22 +70,24 @@ def get_toll_values(segment_ids: list[str]) -> list[float]:
             tier[segment_id] = "rds"
     except Exception:
         logger.exception("[toll_serving] RDS 조회 실패 - S3 스냅샷으로 폴백합니다")
-        snapshot = _snapshot.get()
+        _load_snapshot_once()
         values = {
-            segment_id: snapshot[segment_id]
+            segment_id: _snapshot[segment_id]
             for segment_id in unique_ids
-            if segment_id in snapshot
+            if segment_id in _snapshot
         }
         for segment_id in unique_ids:
-            tier[segment_id] = "snapshot" if segment_id in snapshot else "hardcoded"
+            tier[segment_id] = "snapshot" if segment_id in _snapshot else "hardcoded"
 
     # 요청당 한 번만 남긴다 - Grafana의 "Type4 fallback 계층 비율" 패널이
     # 이 로그를 집계한다.
-    log_tier_summary(
-        logger,
-        "type4_fallback_tier_summary",
-        [tier[segment_id] for segment_id in segment_ids],
-        ["rds", "snapshot", "hardcoded"],
+    tier_counts = {"rds": 0, "snapshot": 0, "hardcoded": 0}
+    for segment_id in segment_ids:
+        tier_counts[tier[segment_id]] += 1
+    logger.info(
+        f"[type4_fallback_tier_summary] rds={tier_counts['rds']} "
+        f"snapshot={tier_counts['snapshot']} hardcoded={tier_counts['hardcoded']} "
+        f"total={len(segment_ids)}"
     )
 
     return [values.get(segment_id, 0.0) for segment_id in segment_ids]
